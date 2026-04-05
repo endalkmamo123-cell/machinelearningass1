@@ -20,6 +20,7 @@ from sklearn.metrics import (
 import joblib
 import warnings
 import os
+from io import StringIO
 
 warnings.filterwarnings('ignore')
 
@@ -29,9 +30,43 @@ warnings.filterwarnings('ignore')
 # %%
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
-train_df = pd.read_csv(os.path.join(script_dir, 'train_dataset.csv'))
-val_df   = pd.read_csv(os.path.join(script_dir, 'val_dataset.csv'))
-test_df  = pd.read_csv(os.path.join(script_dir, 'test_dataset.csv'))
+EXPECTED_COLUMNS = [
+    'Event ID', 'Timestamp', 'Source IP', 'Destination IP',
+    'User Agent', 'Attack Type', 'Attack Severity',
+    'Data Exfiltrated', 'Threat Intelligence', 'Response Action'
+]
+
+def _load_csv_with_header_repair(path, expected_columns=None):
+    expected_columns = expected_columns or EXPECTED_COLUMNS
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        raw = f.read()
+
+    # Repair cases where the header row is prefixed by stray characters
+    header_start = raw.find(expected_columns[0])
+    if header_start > 0:
+        raw = raw[header_start:]
+
+    # Repair cases where the header row is concatenated with the first data row
+    first_newline = raw.find('\n')
+    if first_newline != -1:
+        first_line = raw[:first_newline]
+        last_header = expected_columns[-1]
+        last_index = first_line.find(last_header)
+        if last_index != -1:
+            after_header = first_line[last_index + len(last_header):]
+            if after_header and not after_header.startswith(('\r', '\n')):
+                raw = (
+                    first_line[: last_index + len(last_header)]
+                    + '\n'
+                    + after_header
+                    + raw[first_newline:]
+                )
+
+    return pd.read_csv(StringIO(raw))
+
+train_df = _load_csv_with_header_repair(os.path.join(script_dir, 'train_dataset.csv'))
+val_df = _load_csv_with_header_repair(os.path.join(script_dir, 'val_dataset.csv'))
+test_df = _load_csv_with_header_repair(os.path.join(script_dir, 'test_dataset.csv'))
 
 print(f"Train : {train_df.shape}")
 print(f"Val   : {val_df.shape}")

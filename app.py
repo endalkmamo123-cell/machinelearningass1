@@ -7,8 +7,90 @@ import time
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
+from io import StringIO
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
+
+EXPECTED_CLASSIFICATION_COLUMNS = [
+    'Event ID', 'Timestamp', 'Source IP', 'Destination IP',
+    'User Agent', 'Attack Severity', 'Data Exfiltrated',
+    'Threat Intelligence', 'Response Action'
+]
+
+def _repair_header_and_load_csv(raw, expected_columns=None):
+    expected_columns = expected_columns or EXPECTED_CLASSIFICATION_COLUMNS
+    if isinstance(raw, bytes):
+        raw = raw.decode('utf-8', errors='replace')
+
+    raw = str(raw)
+    header_start = raw.find(expected_columns[0])
+    if header_start > 0:
+        raw = raw[header_start:]
+
+    first_newline = raw.find('\n')
+    if first_newline != -1:
+        first_line = raw[:first_newline]
+        last_header = expected_columns[-1]
+        last_index = first_line.find(last_header)
+        if last_index != -1:
+            after_header = first_line[last_index + len(last_header):]
+            if after_header and not after_header.startswith(('\r', '\n')):
+                raw = (
+                    first_line[: last_index + len(last_header)]
+                    + '\n'
+                    + after_header
+                    + raw[first_newline:]
+                )
+
+    return pd.read_csv(StringIO(raw))
+
+
+def load_csv_with_header_repair(source, expected_columns=None):
+    expected_columns = expected_columns or EXPECTED_CLASSIFICATION_COLUMNS
+    if isinstance(source, (str, os.PathLike)):
+        with open(source, 'r', encoding='utf-8', errors='replace') as f:
+            raw = f.read()
+    elif hasattr(source, 'read'):
+        raw = source.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', errors='replace')
+    else:
+        raise ValueError('Unsupported source type for CSV loader.')
+
+    return _repair_header_and_load_csv(raw, expected_columns=expected_columns)
+
+
+def safe_label_encode_scalar(value, encoder):
+    if value is None:
+        return -1
+    value_str = str(value)
+    classes = encoder.classes_
+    if value_str in classes:
+        return int(np.where(classes == value_str)[0][0])
+    return -1
+
+
+def safe_label_encode_series(series, encoder):
+    lookup = {str(cls): idx for idx, cls in enumerate(encoder.classes_)}
+    return series.astype(str).map(lambda v: lookup.get(v, -1)).astype(int)
+
+
+def prepare_batch_features(df, scaler, encoders=None):
+    expected_cols = list(scaler.feature_names_in_) if hasattr(scaler, 'feature_names_in_') else df.columns.tolist()
+    X = pd.DataFrame(0, index=df.index, columns=expected_cols)
+
+    for col in expected_cols:
+        if col not in df.columns:
+            continue
+
+        if encoders and col in encoders:
+            X[col] = safe_label_encode_series(df[col], encoders[col])
+        elif col == 'Data Exfiltrated':
+            X[col] = df[col].astype(str).str.strip().str.lower().isin(['true', '1', 'yes', 'y']).astype(int)
+        else:
+            X[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    return scaler.transform(X), X
 
 # --- CONFIG ---
 st.set_page_config(
@@ -179,7 +261,7 @@ def _ip_first_octet(ip_str):
         return 0
 
 
-def build_feature_frame(values: dict, template_csv: str, drop_cols=None, scaler=None):
+def build_feature_frame(values: dict, template_csv: str, drop_cols=None, scaler=None, encoders=None):
     # Build a single-row input frame that matches the training feature set.
     if drop_cols is None:
         drop_cols = []
@@ -196,9 +278,14 @@ def build_feature_frame(values: dict, template_csv: str, drop_cols=None, scaler=
 
     for k, v in values.items():
         if k in final.columns:
-            final.at[0, k] = v
+            if encoders and k in encoders:
+                final.at[0, k] = safe_label_encode_scalar(v, encoders[k])
+            elif k == 'Data Exfiltrated':
+                final.at[0, k] = 1 if str(v).strip().lower() in ('true', '1', 'yes', 'y') else 0
+            else:
+                final.at[0, k] = v
 
-    final = final.fillna(0)
+    final = final.apply(pd.to_numeric, errors='coerce').fillna(0)
 
     if final.shape[0] == 0:
         raise ValueError('The constructed input batch is empty (0 samples). Check preprocessing and template loading.')
@@ -220,107 +307,65 @@ with tab1:
         st.warning("⚠️ **Regression Model Selected**: This tab will show duration prediction instead of threat classification. For intrusion detection, switch to 'Standard Classification' in the sidebar.")
     
     with st.form("deep_scan_form"):
-        col1, col2, col3 = st.columns(3)
-        
+        col1, col2 = st.columns(2)
+
         with col1:
-            st.markdown("#### Connectivity")
+            st.markdown("#### Event Identity")
+            event_id = st.text_input("Event ID", "00000000-0000-0000-0000-000000000000")
+            timestamp = st.text_input("Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             src_ip = st.text_input("Source IP", "192.168.1.1")
             dst_ip = st.text_input("Destination IP", "10.0.0.50")
-            src_port = st.number_input("Source Port", 0, 65535, 49152)
-            dst_port = st.number_input("Dest Port", 0, 65535, 80)
-            proto = st.selectbox("Protocol", encoders['proto'].classes_ if 'proto' in encoders else ['tcp', 'udp', 'icmp'])
-            
+            user_agent = st.text_input("User Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
         with col2:
-            st.markdown("#### Flow Metrics")
-            service = st.selectbox("Service", encoders['service'].classes_ if 'service' in encoders else ['http', 'dns', 'ssl', '-'])
-            duration = st.number_input("Flow Duration (sec)", 0.0, 1000.0, 1.5)
-            src_bytes = st.number_input("Source Bytes", 0, 1000000, 2500)
-            dst_bytes = st.number_input("Dest Bytes", 0, 1000000, 450)
-            conn_state = st.selectbox("Conn State", encoders['conn_state'].classes_ if 'conn_state' in encoders else ['SF', 'S0', 'REJ'])
-            
-        with col3:
-            st.markdown("#### Packet Intel")
-            src_pkts = st.number_input("Source Packets", 0, 10000, 15)
-            dst_pkts = st.number_input("Dest Packets", 0, 10000, 8)
-            src_ip_bytes = st.number_input("Src IP Bytes", 0, 1000000, 2600)
-            dst_ip_bytes = st.number_input("Dst IP Bytes", 0, 1000000, 500)
-            missed_bytes = st.number_input("Missed Bytes", 0, 10000, 0)
-            
+            st.markdown("#### Threat Attributes")
+            attack_severity = st.selectbox(
+                "Attack Severity",
+                encoders['Attack Severity'].classes_ if 'Attack Severity' in encoders else ['Low', 'Medium', 'High', 'Critical']
+            )
+            data_exfiltrated = st.selectbox("Data Exfiltrated", ['False', 'True'])
+            threat_intel = st.text_input("Threat Intelligence", "Suspicious activity detected in ingress traffic.")
+            response_action = st.selectbox(
+                "Response Action",
+                encoders['Response Action'].classes_ if 'Response Action' in encoders else ['Blocked', 'Contained', 'Eradicated', 'Recovered']
+            )
+
         submit = st.form_submit_button("RUN NEURAL ANALYSIS ⚡", use_container_width=True)
 
     if submit:
-        with st.spinner("Analyzing high-dimensional threat vector..."):
-            # Reconstruct the feature set exactly as expected by the pipeline
-            # Note: We must include ALL columns that were used in X_train
-            
-            # 1. Create base DF with common columns
-            input_data = {
-                'src_port': [src_port],
-                'dst_port': [dst_port],
-                'proto': [proto],
-                'service': [service],
-                'duration': [duration],
-                'src_bytes': [src_bytes],
-                'dst_bytes': [dst_bytes],
-                'conn_state': [conn_state],
-                'missed_bytes': [missed_bytes],
-                'src_pkts': [src_pkts],
-                'src_ip_bytes': [src_ip_bytes],
-                'dst_pkts': [dst_pkts],
-                'dst_ip_bytes': [dst_ip_bytes],
-                # Add placeholders for other columns the model might expect
-                # In a robust app, we'd store the feature list in joblib as well.
+        with st.spinner("Analyzing the intrusion event..."):
+            values = {
+                'Event ID': event_id,
+                'Timestamp': timestamp,
+                'Source IP': src_ip,
+                'Destination IP': dst_ip,
+                'User Agent': user_agent,
+                'Attack Severity': attack_severity,
+                'Data Exfiltrated': data_exfiltrated,
+                'Threat Intelligence': threat_intel,
+                'Response Action': response_action,
             }
-            
-            # Handling IP octets
-            input_data['src_octet1'] = [_ip_first_octet(src_ip)]
-            input_data['dst_octet1'] = [_ip_first_octet(dst_ip)]
-            
-            input_df = pd.DataFrame(input_data)
-            
-            # Important: Fill in any missing columns with 0 as placeholders
-            # and ensure encoding matches.
-            # (In this case, we'll assume the main features above cover the variance)
-            
-            # Since I don't have the exact training feature list serialized,
-            # use helper resilience routines and scaler metadata when available.
-            
-            processed_df = input_df.copy()
-            for col in ['proto', 'service', 'conn_state']:
-                if col in encoders:
-                    processed_df[col] = encoders[col].transform([processed_df[col][0]])[0]
-            
+
             try:
                 final_X = build_feature_frame(
-                    values=processed_df.iloc[0].to_dict(),
+                    values=values,
                     template_csv=os.path.join(script_dir, 'CLASSIFICATION', 'test_dataset.csv'),
-                    drop_cols=['type', 'label'],
-                    scaler=scaler
+                    scaler=scaler,
+                    encoders=encoders
                 )
 
-                # Re-apply IP octet names explicitly
-                final_X['src_octet1'] = _ip_first_octet(src_ip)
-                final_X['dst_octet1'] = _ip_first_octet(dst_ip)
-
                 if final_X.shape[0] == 0:
-                    st.error('Prepared input contains no samples. Check form entries and template file.'); st.stop()
-
-                if model is None or scaler is None:
-                    st.error("Assets not loaded. Please select a valid model in the sidebar.")
+                    st.error('Prepared input contains no samples. Check form entries and template file.')
                     st.stop()
 
-                # Scaling
                 X_scaled = scaler.transform(final_X)
 
-                # Check if model is classifier or regressor
                 if hasattr(model, 'predict_proba'):
-                    # Classification model
                     pred_idx = model.predict(X_scaled)[0]
                     pred_prob = model.predict_proba(X_scaled)[0]
-                    
                     threat_type = encoders['target'].inverse_transform([pred_idx])[0]
                     confidence = pred_prob[pred_idx] * 100
-                    
+
                     color = "#39FF14" if threat_type == 'normal' else "#FF3131"
                     st.markdown(f"""
                         <div style="background: rgba(0,0,0,0.5); padding: 25px; border-radius: 12px; border-left: 8px solid {color};">
@@ -328,20 +373,19 @@ with tab1:
                             <h4 style="margin:5px 0;">Neural Confidence: {confidence:.2f}%</h4>
                         </div>
                     """, unsafe_allow_html=True)
-                    
+
                     proba_df = pd.DataFrame({
                         'Class': encoders['target'].classes_,
                         'Proba': pred_prob * 100
                     }).sort_values('Proba')
-                    
+
                     fig = px.bar(proba_df, x='Proba', y='Class', orientation='h', color='Proba', color_continuous_scale='Turbo')
                     fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color='#fff')
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    # Regression model - show predicted duration
                     pred_value = model.predict(X_scaled)[0]
-                    actual_pred = np.expm1(pred_value)  # Assuming log-transformed target
-                    
+                    actual_pred = np.expm1(pred_value)
+
                     st.markdown(f"""
                         <div style="background: rgba(0,0,0,0.5); padding: 25px; border-radius: 12px; border-left: 8px solid #0088ff;">
                             <h2 style="color:#0088ff; margin:0;">REGRESSION RESULT</h2>
@@ -349,23 +393,54 @@ with tab1:
                             <p style="margin:0; opacity:0.7;">Note: Regression model selected. For classification, switch to Standard Classification model.</p>
                         </div>
                     """, unsafe_allow_html=True)
-                
             except Exception as e:
-                st.error(f"Analysis Failed: Column Mismatch. Please check if model version matches the UI logic. Log: {e}")
+                st.error(f"Analysis Failed: {e}")
 
 with tab2:
     st.subheader("Real-Time Traffic Interception")
-    if st.button("INTERCEPT PACKET BATCH (TON_IoT Stream)"):
-        with st.spinner("Extracting flow signatures..."):
-            try:
-                batch = pd.read_csv(os.path.join(script_dir, 'CLASSIFICATION', 'test_dataset.csv')).sample(10)
-                # Display original data (truncated)
-                display_cols = ['src_ip', 'src_port', 'dst_ip', 'dst_port', 'proto', 'type']
-                st.dataframe(batch[display_cols], use_container_width=True)
-                
-                st.toast("Packet Batch Identified & Logged.", icon='✅')
-            except:
-                st.error("Error loading stream data.")
+
+    uploaded_file = st.file_uploader(
+        "Upload a CSV dataset for batch inference",
+        type=['csv'],
+        help="Upload a CSV with the same training columns used by the selected model."
+    )
+
+    if uploaded_file is not None:
+        try:
+            batch_df = load_csv_with_header_repair(uploaded_file, expected_columns=list(scaler.feature_names_in_) if hasattr(scaler, 'feature_names_in_') else None)
+            st.success("Upload successful. Previewing first rows below.")
+            st.dataframe(batch_df.head(10), use_container_width=True)
+
+            if st.button("RUN BATCH INFERENCE 🔍"):
+                with st.spinner("Running model inference on uploaded data..."):
+                    X_scaled, _ = prepare_batch_features(batch_df, scaler, encoders=encoders)
+                    predictions = model.predict(X_scaled)
+
+                    if hasattr(model, 'predict_proba'):
+                        probs = model.predict_proba(X_scaled)
+                        batch_df['Predicted Attack Type'] = encoders['target'].inverse_transform(predictions)
+                        batch_df['Confidence (%)'] = np.max(probs, axis=1) * 100
+                    else:
+                        batch_df['Predicted Duration'] = np.expm1(predictions)
+
+                    st.markdown("### Inference Results")
+                    st.dataframe(batch_df.head(20), use_container_width=True)
+        except Exception as e:
+            st.error(f"Upload failed: {e}")
+
+    st.markdown("---")
+    st.markdown("### Sample Stream Data Preview")
+    try:
+        if model_choice == "Standard Classification":
+            batch = pd.read_csv(os.path.join(script_dir, 'CLASSIFICATION', 'test_dataset.csv')).sample(10)
+            display_cols = ['Event ID', 'Timestamp', 'Source IP', 'Destination IP', 'Attack Type']
+        else:
+            batch = pd.read_csv(os.path.join(script_dir, 'REGRESSION', 'test.csv')).sample(10)
+            display_cols = ['src_ip', 'src_port', 'dst_ip', 'dst_port', 'proto']
+        st.dataframe(batch[display_cols], use_container_width=True)
+        st.success("Sample data loaded successfully.")
+    except Exception as e:
+        st.error(f"Error loading stream data: {e}")
 
 with tab3:
     st.subheader("Fleet Threat Intelligence")
