@@ -108,22 +108,60 @@ model_choice = st.sidebar.radio("Select Model Neural Core", ["Standard Classific
 
 @st.cache_resource
 def load_assets(choice):
+    # More robust path resolution for different deployment environments
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    try:
+
+    # Try multiple path strategies for maximum compatibility
+    possible_paths = [
+        script_dir,  # Local development
+        os.getcwd(),  # Current working directory
+        os.path.join(script_dir, '..'),  # Parent directory
+    ]
+
+    model_path = None
+    encoders_path = None
+    scaler_path = None
+
+    # Find the correct paths by checking file existence
+    for base_path in possible_paths:
         if choice == "Standard Classification":
-            model = joblib.load(os.path.join(script_dir, 'CLASSIFICATION', 'best_xgb_model.pkl'))
-            encoders = joblib.load(os.path.join(script_dir, 'CLASSIFICATION', 'encoders.pkl'))
-            scaler = joblib.load(os.path.join(script_dir, 'CLASSIFICATION', 'scaler.pkl'))
+            candidate_model = os.path.join(base_path, 'CLASSIFICATION', 'best_xgb_model.pkl')
+            candidate_encoders = os.path.join(base_path, 'CLASSIFICATION', 'encoders.pkl')
+            candidate_scaler = os.path.join(base_path, 'CLASSIFICATION', 'scaler.pkl')
+        else:
+            candidate_model = os.path.join(base_path, 'REGRESSION', 'regression_xgb_model.pkl')
+            candidate_encoders = os.path.join(base_path, 'REGRESSION', 'regression_encoders.pkl')
+            candidate_scaler = os.path.join(base_path, 'REGRESSION', 'regression_scaler.pkl')
+
+        if os.path.exists(candidate_model) and os.path.exists(candidate_encoders) and os.path.exists(candidate_scaler):
+            model_path = candidate_model
+            encoders_path = candidate_encoders
+            scaler_path = candidate_scaler
+            break
+
+    if not model_path:
+        # Fallback: try relative paths from current working directory
+        if choice == "Standard Classification":
+            model_path = 'CLASSIFICATION/best_xgb_model.pkl'
+            encoders_path = 'CLASSIFICATION/encoders.pkl'
+            scaler_path = 'CLASSIFICATION/scaler.pkl'
             folder_prefix = 'classification'
         else:
-            # Load from regression folder
-            model = joblib.load(os.path.join(script_dir, 'REGRESSION', 'regression_xgb_model.pkl'))
-            encoders = joblib.load(os.path.join(script_dir, 'REGRESSION', 'regression_encoders.pkl'))
-            scaler = joblib.load(os.path.join(script_dir, 'REGRESSION', 'regression_scaler.pkl'))
+            model_path = 'REGRESSION/regression_xgb_model.pkl'
+            encoders_path = 'REGRESSION/regression_encoders.pkl'
+            scaler_path = 'REGRESSION/regression_scaler.pkl'
             folder_prefix = 'regression'
+    else:
+        folder_prefix = 'classification' if choice == "Standard Classification" else 'regression'
+
+    try:
+        model = joblib.load(model_path)
+        encoders = joblib.load(encoders_path)
+        scaler = joblib.load(scaler_path)
         return model, encoders, scaler, folder_prefix
     except Exception as e:
         st.sidebar.error(f"Error loading {choice}: {e}")
+        st.sidebar.info(f"Checked paths: {model_path}, {encoders_path}, {scaler_path}")
         return None, None, None, None
 
 model, encoders, scaler, folder_prefix = load_assets(model_choice)
