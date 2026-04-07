@@ -1,3 +1,8 @@
+"""
+IDS Command Center v2.1 - Streamlit Cloud Deployment
+Last updated: April 7, 2026
+"""
+
 import os
 import streamlit as st
 import pandas as pd
